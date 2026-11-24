@@ -22,7 +22,23 @@ AddInLoader —— 通用 Excel 自定义加载项装载器
 
 生命周期：点「关闭」或窗口 X 隐藏到系统托盘、后台继续扫描；托盘左键
 显隐窗口，右键菜单含显示窗口／开机启动开关／退出；只有「退出」才真正
-结束进程。支持注册表 Run 键开机启动（--background 静默驻留托盘）。
+结束进程。开机启动用计划任务（ONLOGON/交互式/RunLevel=Highest，--background
+静默驻留托盘），旧 Run 键自动迁移；没有可装载目标时自动取消开机启动。
+
+v1.0.1 安全加固：
+  1. 宿主校验：枚举到 XLMAIN/EXCEL7 后复核所属进程必须是 EXCEL.EXE，
+     WPS 表格复用同类窗口名一律跳过。
+  2. 路径信任四态：受信任位置 / 会话临时信任 / 同名异路径 / 未受信任；
+     临时启动与长期启动共用判据，同名异路径副本不装载、不执行宏。
+  3. 不持有加载项工作簿的 COM 引用，按名字取回并核对 FullName 后关闭；
+     判重逻辑同步改用工作簿在位检查。
+  4. 关闭 Excel 前先提示保存并轮询等待（最多 45 秒），超时经确认才强制
+     结束；高级选项可改为超时自动强制结束。
+  5. 日志落盘，--selfcheck 输出源文件/exe 的 SHA-256，tests/test_v101.py
+     为不依赖 Excel 的回归脚本。
+  6. README 醒目标注 %APPDATA% 管理目录作为用户可写受信任位置的残余风险。
+  7. 开机启动改为计划任务 ONLOGON + /IT + /RL HIGHEST；旧 Run 键自动迁移，
+     任务路径/权限异常自修复，程序文件或加载目标消失时自动取消。
 
 通道：oleacc!AccessibleObjectFromWindow(OBJID_NATIVEOM) 取 Excel Application，
 微软文档化的 Office Native OM 附着方式；不挂钩子、不注入、不写 HKLM、
@@ -35,10 +51,10 @@ AddInLoader —— 通用 Excel 自定义加载项装载器
   AddInLoader.exe --xlam <路径>   仅装载指定 xlam（排障用，跳过自动发现）
 """
 # 版本信息（统一在此维护，随版本更新）
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 
-import base64
 import ctypes
+import base64
 import hashlib
 import json
 import os
@@ -54,6 +70,7 @@ import urllib.error
 import urllib.request
 import webbrowser
 import winreg
+import xml.etree.ElementTree as ET
 from collections import deque
 from ctypes import wintypes
 from tkinter import font as tkfont
@@ -64,6 +81,19 @@ import comtypes.automation as auto
 
 TOOL_NAME = "AddInLoader"
 AIL_PREFIX = "AIL_"
+EXCEL_CLOSE_TIMEOUT = 45      # 卸载/长期启动前等待 Excel 自行退出的秒数
+EXCEL_CLOSE_POLL_MS = 500
+FORCE_PREF_KEY = "allow_force_close"
+TRUST_TRUSTED = "trusted"
+TRUST_SESSION = "session"
+TRUST_FOREIGN = "foreign"
+TRUST_DENIED = "denied"
+TRUST_LABELS = {
+    TRUST_TRUSTED: "受信任位置",
+    TRUST_SESSION: "会话临时信任",
+    TRUST_FOREIGN: "同名异路径副本",
+    TRUST_DENIED: "未受信任",
+}
 RELEASE_PAGE_URL = "https://github.com/YehOlt/AddInLoader/releases"
 UPDATE_API = "https://api.github.com/repos/YehOlt/AddInLoader/releases/latest"
 TAGS_API = "https://api.github.com/repos/YehOlt/AddInLoader/tags"
@@ -80,6 +110,10 @@ OFFICE_VERS = ("16.0", "15.0", "14.0")
 # ---- 开机启动 ----
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_NAME = "AddInLoader"
+TASK_NAME = "AddInLoader Background"
+AUTOSTART_GRACE = 30       # 启动后留 30 秒给自动发现，避免误判“没有目标”
+AUTOSTART_CHECK_SEC = 60
+STARTUP_NOTICE = ""
 
 # ---- 单实例 ----
 MUTEX_NAME = "Local\\AddInLoader_SingleInstance"
@@ -128,6 +162,18 @@ _oleacc.AccessibleObjectFromWindow.restype = ctypes.HRESULT
 _user32 = ctypes.windll.user32
 _shell32 = ctypes.windll.shell32
 _kernel32 = ctypes.windll.kernel32
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_user32.GetWindowThreadProcessId.argtypes = [
+    wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+_user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+_kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+_kernel32.OpenProcess.restype = wintypes.HANDLE
+_kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+_kernel32.CloseHandle.restype = wintypes.BOOL
+_kernel32.QueryFullProcessImageNameW.argtypes = [
+    wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+    ctypes.POINTER(wintypes.DWORD)]
+_kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
 _user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
 _user32.RegisterWindowMessageW.restype = wintypes.UINT
 TASKBAR_CREATED = _user32.RegisterWindowMessageW("TaskbarCreated")
@@ -483,6 +529,110 @@ def remove_trusted_location():
     return removed
 
 
+# ---- 路径信任（v1.0.1）----
+# 自动装载只认 Excel 受信任位置；文件对话框显式选择 / --xlam 指定的文件
+# 记入会话信任集，退出装载器即失效，不写注册表。
+_SESSION_TRUSTED = set()
+_TRUST_CACHE = {"ts": 0.0, "locs": []}
+_TRUST_TTL = 30.0
+
+
+def _norm_dir(path):
+    s = norm_path(os.path.abspath(os.path.expandvars(str(path))))
+    return s.rstrip("\\") or s
+
+
+def trusted_locations(force=False):
+    """读取 Excel 受信任位置 [(目录, 是否含子目录)]，30 秒缓存。"""
+    now = time.time()
+    if not force and _TRUST_CACHE["locs"] and now - _TRUST_CACHE["ts"] < _TRUST_TTL:
+        return _TRUST_CACHE["locs"]
+    locs = []
+    bases = []
+    for ver in OFFICE_VERS:
+        bases.append(r"Software\Microsoft\Office\%s\Excel\Security\Trusted Locations" % ver)
+        bases.append(r"Software\WOW6432Node\Microsoft\Office\%s\Excel\Security\Trusted Locations" % ver)
+    for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+        for base in bases:
+            try:
+                key = winreg.OpenKey(hive, base)
+            except OSError:
+                continue
+            try:
+                idx = 0
+                while True:
+                    try:
+                        sub = winreg.EnumKey(key, idx)
+                    except OSError:
+                        break
+                    idx += 1
+                    try:
+                        sk = winreg.OpenKey(hive, base + "\\" + sub)
+                        try:
+                            val, _ = winreg.QueryValueEx(sk, "Path")
+                            allow = 1
+                            try:
+                                a, _ = winreg.QueryValueEx(sk, "AllowSubFolders")
+                                allow = int(a)
+                            except OSError:
+                                pass
+                        finally:
+                            winreg.CloseKey(sk)
+                        if val:
+                            locs.append((_norm_dir(val), bool(allow)))
+                    except OSError:
+                        continue
+            finally:
+                winreg.CloseKey(key)
+    _TRUST_CACHE["ts"] = now
+    _TRUST_CACHE["locs"] = locs
+    return locs
+
+
+def is_auto_trusted(path):
+    """自动装载策略：文件所在目录属于任一受信任位置（含子目录按 AllowSubFolders）。"""
+    d = _norm_dir(os.path.dirname(os.path.abspath(path)))
+    for base, allow in trusted_locations():
+        if d == base or (allow and d.startswith(base + "\\")):
+            return True
+    return False
+
+
+def mark_session_trusted(path):
+    _SESSION_TRUSTED.add(norm_path(path))
+    _TRUST_CACHE["ts"] = 0.0
+
+
+def trust_state(path, app=None):
+    """统一四态：受信任位置 / 会话临时信任 / 同名异路径 / 未受信任。
+
+    临时启动与长期启动共用此判据；传入 app 时额外检测同名异路径副本。
+    """
+    if not os.path.isfile(path):
+        return TRUST_DENIED, "文件不存在"
+    n = norm_path(path)
+    if app is not None:
+        existing = workbook_by_name(app, os.path.basename(path))
+        if existing is not None:
+            try:
+                ep = existing.FullName
+            except Exception:
+                ep = ""
+            if ep and norm_path(ep) != n:
+                return TRUST_FOREIGN, "存在同名异路径副本"
+    if n in _SESSION_TRUSTED:
+        return TRUST_SESSION, "会话临时信任"
+    if is_auto_trusted(path):
+        return TRUST_TRUSTED, "受信任位置"
+    return TRUST_DENIED, "不在 Excel 受信任位置"
+
+
+def xlam_allowed(path):
+    """路径层判据（不含运行时的同名异路径态），返回 (是否允许, 原因)。"""
+    state, why = trust_state(path)
+    return state in (TRUST_SESSION, TRUST_TRUSTED), why
+
+
 def _read_managed():
     try:
         with open(_managed_path(), "r", encoding="utf-8") as fh:
@@ -681,15 +831,35 @@ def close_excel_processes():
     return killed
 
 
+def window_process_name(hwnd):
+    """取窗口所属进程名；识别不了返回空串（调用方必须 fail-closed）。"""
+    pid = wintypes.DWORD()
+    _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    if not pid.value:
+        return ""
+    h = _kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+    if not h:
+        return ""
+    try:
+        size = wintypes.DWORD(1024)
+        buf = ctypes.create_unicode_buffer(1024)
+        if not _kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+            return ""
+        return os.path.basename(buf.value).lower()
+    finally:
+        _kernel32.CloseHandle(h)
+
+
 def find_excel_doc_windows():
-    """枚举 XLMAIN 顶层窗口下的 EXCEL7 文档窗口句柄。"""
+    """枚举 EXCEL.EXE 的 XLMAIN/EXCEL7 文档窗口。"""
     tops = []
 
     def top_cb(hwnd, _lp):
         buf = ctypes.create_unicode_buffer(64)
         _user32.GetClassNameW(hwnd, buf, 64)
-        if buf.value == "XLMAIN":
-            tops.append(hwnd)
+        if buf.value != "XLMAIN" or window_process_name(hwnd) != "excel.exe":
+            return True
+        tops.append(hwnd)
         return True
 
     _user32.EnumWindows(_WNDENUMPROC(top_cb), 0)
@@ -725,41 +895,99 @@ def get_excel_app(hwnd):
 
 
 _LOADED_APPS = set()
-_TEMP_WBS = {}
+_SKIP_LOGGED = set()
+
+
+def _prefs_path():
+    return os.path.join(managed_dir(), "prefs.json")
+
+
+def read_prefs():
+    try:
+        with open(_prefs_path(), "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def write_pref(key, value):
+    try:
+        data = read_prefs()
+        data[key] = value
+        path = _prefs_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        return False
+
+
+def _run_log_path():
+    return os.path.join(managed_dir(), "addinloader.log")
+
+
+def write_run_log(text):
+    """追加落盘日志，超过 1 MB 滚动一次；失败不影响主流程。"""
+    path = _run_log_path()
+    try:
+        if os.path.isfile(path) and os.path.getsize(path) >= 1024 * 1024:
+            os.replace(path, path + ".1")
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write("%s  %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), text))
+    except OSError:
+        pass
+
+
+def workbook_by_name(app, name):
+    try:
+        return app.Workbooks.Item(name)
+    except Exception:
+        return None
+
+
+def workbook_in_place(app, xlam):
+    """按名字取工作簿并核对完整路径：加载项工作簿不在 Workbooks 计数里，但 Item(name) 可取。"""
+    wb = workbook_by_name(app, os.path.basename(xlam))
+    if wb is None:
+        return False, None
+    try:
+        p = wb.FullName
+    except Exception:
+        p = ""
+    return (bool(p) and norm_path(p) == norm_path(xlam)), wb
 
 
 def provision(app, hwnd, xlam):
-    """幂等装载到当前会话。OPEN 登记由 register_addin 负责，本函数不写注册表。"""
-    key = (int(hwnd), norm_path(xlam))
+    """幂等装载到当前会话；用完即释放 COM 引用，按工作簿在位判重。"""
     target = norm_path(xlam)
-    wb = _TEMP_WBS.get(key)
-    if wb is not None:
+    key = (int(hwnd), target)
+    state, _why = trust_state(xlam, app)
+    if state == TRUST_FOREIGN:
+        return "foreign"
+    existing = workbook_by_name(app, os.path.basename(xlam))
+    if existing is not None:
         try:
-            _ = wb.Name
-            _LOADED_APPS.add(key)
-            return "already"
+            ep = existing.FullName
         except Exception:
-            _TEMP_WBS.pop(key, None)
-    # Excel 已通过 OPEN 自行加载该项（Installed=True），无需重复装载
-    try:
-        for i in range(1, app.AddIns.Count + 1):
-            candidate = app.AddIns.Item(i)
-            if (candidate.FullName and norm_path(candidate.FullName) == target
-                    and candidate.Installed):
-                _LOADED_APPS.add(key)
-                return "already"
-    except Exception:
-        pass
-    # 用 add-in 工作簿打开：IsAddin=True，功能区生效，不进 Workbooks 集合，
-    # 必须持有 Open 返回的对象才能关闭。不走 AddIns.Add——该方法在本环境会抛
-    # 异常，且异常会令 Excel 退出时反向清除 OPEN 登记。
+            ep = ""
+        if ep and norm_path(ep) != target:
+            return "foreign"
+        if not ep:
+            return "failed"
+        _LOADED_APPS.add(key)
+        return "already"
+    # 用 add-in 工作簿打开：IsAddin=True，功能区生效，不进 Workbooks 集合。
+    # 不持有返回对象；卸载时按名字取回工作簿并核对 FullName 后关闭。
     try:
         wb = app.Workbooks.Open(xlam)
         if wb is None:
             return "failed"
     except Exception:
         return "failed"
-    _TEMP_WBS[key] = wb
     _LOADED_APPS.add(key)
     return "loaded"
 
@@ -768,12 +996,12 @@ def unload_from_excel(app, hwnd, xlam):
     """关闭指定加载项：临时工作簿与长期 AddIns 项都处理。"""
     closed = 0
     target = norm_path(xlam)
-    key = (int(hwnd), target)
-    wb = _TEMP_WBS.pop(key, None)
+    wb = workbook_by_name(app, os.path.basename(xlam))
     if wb is not None:
         try:
-            wb.Close(SaveChanges=False)
-            closed += 1
+            if norm_path(wb.FullName) == target:
+                wb.Close(SaveChanges=False)
+                closed += 1
         except Exception:
             pass
     try:
@@ -788,6 +1016,8 @@ def unload_from_excel(app, hwnd, xlam):
     except Exception:
         pass
     _LOADED_APPS.discard((int(hwnd), target))
+    for vkey in [k for k in _VERIFIED if k[0] == int(hwnd) and k[1] == target]:
+        _VERIFIED.discard(vkey)
     return closed
 
 
@@ -829,12 +1059,28 @@ def worker(stop, outq, unloadq, kick, get_targets, interval):
                     for xlam in targets:
                         if stop.is_set():
                             break
+                        allowed, why = xlam_allowed(xlam)
+                        if not allowed:
+                            if norm_path(xlam) not in _SKIP_LOGGED:
+                                _SKIP_LOGGED.add(norm_path(xlam))
+                                outq.put(("log", "跳过 %s：%s"
+                                          % (os.path.basename(xlam), why)))
+                            continue
                         try:
                             result = provision(app, hwnd, xlam)
+                            if result == "foreign":
+                                if norm_path(xlam) not in _SKIP_LOGGED:
+                                    _SKIP_LOGGED.add(norm_path(xlam))
+                                    outq.put(("log", "跳过 %s：存在同名异路径副本"
+                                              % os.path.basename(xlam)))
+                                continue
                             if result in ("loaded", "already"):
                                 loaded_paths.add(norm_path(xlam))
-                            if result == "loaded":
-                                outq.put(("log", "已装载 %s"
+                                if result == "loaded":
+                                    outq.put(("log", "已装载 %s"
+                                              % os.path.basename(xlam)))
+                            elif result == "failed":
+                                outq.put(("log", "装载 %s 失败"
                                           % os.path.basename(xlam)))
                         except Exception as exc:
                             outq.put(("log", "装载 %s 失败：%s"
@@ -851,7 +1097,7 @@ def worker(stop, outq, unloadq, kick, get_targets, interval):
         comtypes.CoUninitialize()
 
 
-# ---- 开机启动 ----
+# ---- 开机启动：计划任务 Highest ----
 def autostart_command():
     exe = sys.executable
     if getattr(sys, "frozen", False):
@@ -859,34 +1105,280 @@ def autostart_command():
     return '"%s" "%s" --background' % (exe, os.path.abspath(__file__))
 
 
-def is_autostart():
+def _schtasks(args):
+    try:
+        p = subprocess.run(["schtasks"] + args, capture_output=True, text=True,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                           timeout=20)
+        return p.returncode, p.stdout, p.stderr
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return -1, "", str(exc)
+
+
+def _local_tag(tag):
+    return tag.rsplit("}", 1)[-1]
+
+
+def task_info():
+    """读取计划任务的动作/权限/登录类型；XML 标签不受系统语言影响。"""
+    rc, out, _err = _schtasks(["/Query", "/TN", TASK_NAME, "/XML"])
+    if rc != 0:
+        return None
+    try:
+        root = ET.fromstring(out.lstrip("\ufeff \r\n\t"))
+    except ET.ParseError:
+        return None
+    info = {"enabled": None, "command": "", "arguments": "",
+            "run_level": "", "logon_type": ""}
+    for el in root.iter():
+        name = _local_tag(el.tag)
+        text = (el.text or "").strip()
+        if name == "Enabled" and info["enabled"] is None:
+            info["enabled"] = text.lower() == "true"
+        elif name == "Command" and not info["command"]:
+            info["command"] = text
+        elif name == "Arguments" and not info["arguments"]:
+            info["arguments"] = text
+        elif name == "RunLevel" and not info["run_level"]:
+            info["run_level"] = text
+        elif name == "LogonType" and not info["logon_type"]:
+            info["logon_type"] = text
+    return info
+
+
+def task_command(info):
+    args = info.get("arguments", "")
+    return (info.get("command", "") + (" " + args if args else "")).strip()
+
+
+def norm_task_command(text):
+    return " ".join(text.replace('"', "").lower().split())
+
+
+def _legacy_run_value():
     try:
         key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY)
         val, _ = winreg.QueryValueEx(key, RUN_NAME)
         winreg.CloseKey(key)
-        return bool(val)
+        return val
     except OSError:
-        return False
+        return None
+
+
+def _remove_legacy_run():
+    try:
+        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
+                             winreg.KEY_SET_VALUE)
+        try:
+            winreg.DeleteValue(key, RUN_NAME)
+        finally:
+            winreg.CloseKey(key)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def is_autostart():
+    info = task_info()
+    if info and info.get("enabled") is not False:
+        return True
+    return bool(_legacy_run_value())
 
 
 def set_autostart(enabled):
-    key = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
-                             winreg.KEY_SET_VALUE)
-    try:
-        if enabled:
-            winreg.SetValueEx(key, RUN_NAME, 0, winreg.REG_SZ, autostart_command())
-        else:
-            try:
-                winreg.DeleteValue(key, RUN_NAME)
-            except FileNotFoundError:
-                pass
-    finally:
-        winreg.CloseKey(key)
+    if not enabled:
+        _schtasks(["/Delete", "/TN", TASK_NAME, "/F"])
+        _remove_legacy_run()
+        return
+    rc, _out, err = _schtasks([
+        "/Create", "/TN", TASK_NAME, "/SC", "ONLOGON",
+        "/TR", autostart_command(), "/RL", "HIGHEST", "/IT", "/F"])
+    if rc != 0:
+        # 计划任务不可用时保留旧 Run 键作为回退，并明确报告
+        key = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, RUN_KEY, 0,
+                                 winreg.KEY_SET_VALUE)
+        try:
+            winreg.SetValueEx(key, RUN_NAME, 0, winreg.REG_SZ,
+                              autostart_command())
+        finally:
+            winreg.CloseKey(key)
+        raise RuntimeError(
+            "计划任务注册失败，已回退注册表 Run（登录会弹 UAC）：%s"
+            % err.strip()[:200])
+    _remove_legacy_run()
+
+
+def migrate_autostart():
+    """把 v1.0.0 的 HKCU Run 一次性迁移到计划任务，避免两处都启动。"""
+    if not _legacy_run_value():
+        return None
+    if task_info() is None:
+        set_autostart(True)
+        return "旧注册表开机启动已迁移为计划任务（Highest）"
+    _remove_legacy_run()
+    return "旧注册表开机启动已清理，计划任务保持启用"
+
+
+def autostart_targets_exist():
+    if not os.path.isfile(sys.executable):
+        return False
+    return (getattr(sys, "frozen", False)
+            or os.path.isfile(os.path.abspath(__file__)))
+
+
+def autostart_health_fix():
+    """修正路径漂移/权限降级/旧键残留；程序文件删除则取消任务。返回提示或 None。"""
+    notes = []
+    if _legacy_run_value():
+        _remove_legacy_run()
+        notes.append("已清理残留的注册表开机启动项")
+    info = task_info()
+    if info is None:
+        return "；".join(notes) or None
+    if not autostart_targets_exist():
+        set_autostart(False)
+        notes.append("程序文件已删除，已自动取消开机启动")
+        return "；".join(notes)
+    expected = norm_task_command(autostart_command())
+    actual = norm_task_command(task_command(info))
+    wrong_level = info.get("run_level") not in ("HighestAvailable", "Highest")
+    wrong_logon = info.get("logon_type") not in ("InteractiveToken", "Interactive")
+    if expected != actual or wrong_level or wrong_logon:
+        set_autostart(True)
+        notes.append("开机启动任务已修复（路径/权限/登录类型）")
+    return "；".join(notes) or None
+
+
+_LOADER_EXE_RE = re.compile(r"^AddInLoader.*\.exe$", re.I)
+_EXE_VERSION_RE = re.compile(r"[_-]v?(\d+)\.(\d+)\.(\d+)", re.I)
 
 
 def version_tuple(text):
     m = re.search(r"(\d+)\.(\d+)\.(\d+)", str(text))
     return tuple(int(x) for x in m.groups()) if m else (0, 0, 0)
+
+
+def exe_version(path):
+    """从 exe 文件名解析版本；识别不了返回 None（保守让位，不误杀）。"""
+    m = _EXE_VERSION_RE.search(os.path.basename(str(path)))
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def iter_loader_processes():
+    """枚举运行中的 AddInLoader*.exe 进程，yield (pid, exe_path)。"""
+    TH32CS_SNAPPROCESS = 0x00000002
+    INVALID = ctypes.c_void_p(-1).value
+
+    class PROCENTRY(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    snap = _kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snap or snap == INVALID:
+        return
+    try:
+        entry = PROCENTRY()
+        entry.dwSize = ctypes.sizeof(PROCENTRY)
+        ok = _kernel32.Process32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            name = str(entry.szExeFile).split("\x00", 1)[0]
+            pid = int(entry.th32ProcessID)
+            if name and _LOADER_EXE_RE.match(name):
+                h = _kernel32.OpenProcess(
+                    PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+                if h:
+                    try:
+                        size = wintypes.DWORD(1024)
+                        buf = ctypes.create_unicode_buffer(1024)
+                        if _kernel32.QueryFullProcessImageNameW(
+                                h, 0, buf, ctypes.byref(size)):
+                            yield pid, buf.value
+                    finally:
+                        _kernel32.CloseHandle(h)
+            ok = _kernel32.Process32NextW(snap, ctypes.byref(entry))
+    finally:
+        _kernel32.CloseHandle(snap)
+
+
+def running_loader_versions():
+    """返回 [(pid, exe_path, 版本元组或None)]，排除自身与自身的父进程。
+
+    PyInstaller onefile 的 bootloader 父进程与实际子进程同名（都是
+    AddInLoader_vX.Y.Z.exe）；若不排除父进程，仲裁会误判"同版本实例已在运行"
+    而让位，随后单实例 mutex 被低版本占用，高版本静默退出。
+    """
+    me = os.getpid()
+    parent = os.getppid()
+    return [(pid, path, exe_version(path))
+            for pid, path in iter_loader_processes()
+            if pid != me and pid != parent]
+
+
+def terminate_pids(pids):
+    killed = 0
+    for pid in pids:
+        h = _kernel32.OpenProcess(0x0001, False, pid)  # PROCESS_TERMINATE
+        if not h:
+            continue
+        try:
+            if _kernel32.TerminateProcess(h, 0):
+                killed += 1
+        finally:
+            _kernel32.CloseHandle(h)
+    if killed:
+        time.sleep(0.5)
+    return killed
+
+
+def clear_lower_autostart(paths):
+    """清除指向低版本 exe 的开机启动，并重注册指向当前版本。"""
+    cleared = False
+    run_val = _legacy_run_value()
+    if run_val and any(norm_path(p) in norm_path(run_val) for p in paths):
+        _remove_legacy_run()
+        cleared = True
+    info = task_info()
+    if info:
+        cmd = task_command(info)
+        if any(norm_path(p) in norm_path(cmd) for p in paths):
+            set_autostart(False)
+            cleared = True
+    if not cleared:
+        return []
+    try:
+        set_autostart(True)
+        return ["旧启动项已改指向当前版本"]
+    except Exception as exc:
+        return ["旧启动项已清除但重建失败：%s" % exc]
+
+
+def take_over_older_instances():
+    """版本仲裁：更高/未知版本在跑则让位；仅低版本在跑则结束并接管。"""
+    my = version_tuple(VERSION)
+    others = running_loader_versions()
+    if any(ver is None or ver >= my for _pid, _path, ver in others):
+        return None
+    lower = [(pid, path) for pid, path, ver in others
+             if ver is not None and ver < my]
+    if not lower:
+        return None
+    killed = terminate_pids([pid for pid, _ in lower])
+    notes = clear_lower_autostart([path for _, path in lower])
+    msg = "已接管低版本实例：结束 %d 个进程" % killed
+    if notes:
+        msg += "，清除%s" % "、".join(notes)
+    return msg
 
 
 def fetch_latest_release(timeout=8):
@@ -952,15 +1444,6 @@ def compare_versions(a, b):
     """返回 1 表示 a 更新，-1 更旧，0 相同。"""
     ta, tb = version_tuple(a), version_tuple(b)
     return (ta > tb) - (ta < tb)
-
-
-def silent_update_target(tag, url, err, current=VERSION):
-    """静默检查的落点：有新版返回发布页 URL，其余返回空串（不弹窗、不打开）。"""
-    if err or not tag:
-        return ""
-    if compare_versions(tag, current) <= 0:
-        return ""
-    return url or RELEASE_PAGE_URL
 
 
 # ---- 一键更新：清单 + 下载校验 + 校验即启动 ----
@@ -1108,6 +1591,15 @@ def run_one_click_update(manifest_url=None, log=print, dry_run=False, current=VE
     return "已启动新版本 %s；旧版窗口即将被新版接管。" % latest
 
 
+def silent_update_target(tag, url, err, current=VERSION):
+    """静默检查的落点：有新版返回发布页 URL，其余返回空串（不弹窗、不打开）。"""
+    if err or not tag:
+        return ""
+    if compare_versions(tag, current) <= 0:
+        return ""
+    return url or RELEASE_PAGE_URL
+
+
 def acquire_single_instance():
     """返回 (mutex句柄, 是否首个实例)。非首个实例会广播唤起消息。"""
     _kernel32.GetLastError.restype = wintypes.DWORD
@@ -1126,11 +1618,30 @@ def selfcheck(xlam):
     print("comtypes        : OK")
     try:
         wins = find_excel_doc_windows()
-        print("窗口枚举        : OK（当前 EXCEL7 窗口 %d 个）" % len(wins))
+        print("窗口枚举        : OK（当前 EXCEL.EXE 的 EXCEL7 窗口 %d 个）" % len(wins))
     except Exception as exc:
         print("窗口枚举        : FAIL %s" % exc)
         ok = False
-    print("开机启动        : %s" % ("已启用" if is_autostart() else "未启用"))
+    info = task_info()
+    if info:
+        print("开机启动        : 计划任务 %s（%s / %s / %s）" % (
+            "已启用" if info.get("enabled") is not False else "已禁用",
+            TASK_NAME, info.get("run_level") or "?", info.get("logon_type") or "?"))
+    else:
+        print("开机启动        : %s" % (
+            "已启用（旧 Run 键，待迁移）" if _legacy_run_value() else "未启用"))
+    print("超时自动强制    : %s" % (
+        "已启用" if read_prefs().get(FORCE_PREF_KEY) else "未启用（超时后询问）"))
+    target = sys.executable if getattr(sys, "frozen", False) else __file__
+    try:
+        digest = hashlib.sha256()
+        with open(target, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                digest.update(chunk)
+        print("文件哈希        : SHA-256 %s（%s）"
+              % (digest.hexdigest(), os.path.basename(target)))
+    except OSError as exc:
+        print("文件哈希        : FAIL %s" % exc)
     print("托盘结构        : OK（%d bytes）" % ctypes.sizeof(NOTIFYICONDATAW))
     for ver in OFFICE_VERS:
         entries = open_entries(ver)
@@ -1141,6 +1652,10 @@ def selfcheck(xlam):
             break
     else:
         print("OPEN 登记       : 未发现")
+    print("受信任位置      : %d 处（自动装载仅接受这些目录）" % len(trusted_locations(True)))
+    print("管理目录        : %s（%s）" % (
+        managed_dir(), "已受信任" if is_auto_trusted(
+            os.path.join(managed_dir(), "probe.xlam")) else "未受信任"))
     if xlam:
         if os.path.isfile(xlam):
             print("指定加载项      : OK %s" % xlam)
@@ -1231,11 +1746,15 @@ class LoaderApp:
         self.root = root
         self.fixed = fixed
         self.background = background
+        for p in (fixed or []):
+            mark_session_trusted(p)
         self.deselected = set()
         self.addins = [(p, "手动指定") for p in fixed] if fixed else discover_addins()
         self.extra = []
         self.discover_sig = self._sig(self.addins)
         self.last_discover = time.monotonic()
+        self.started_at = time.monotonic()
+        self.last_autostart_check = time.monotonic()
         self.lock = threading.Lock()
         self.stop = threading.Event()
         self.kick = threading.Event()
@@ -1282,7 +1801,7 @@ class LoaderApp:
         dir_row.pack(fill="x", padx=8, pady=2)
         tk.Label(dir_row, anchor="w", font=("Microsoft YaHei", 9),
                  text="管理目录：").pack(side="left")
-        dir_link = tk.Label(dir_row, anchor="w", justify="left", wraplength=260,
+        dir_link = tk.Label(dir_row, anchor="w", justify="left", wraplength=340,
                             font=("Microsoft YaHei", 9, "underline"),
                             fg="#0563c1", cursor="hand2", text=managed_dir())
         dir_link.pack(side="left")
@@ -1297,7 +1816,7 @@ class LoaderApp:
         opt.pack(side="right", fill="both", padx=(3, 0))
         self.var_autostart = tk.BooleanVar(value=is_autostart())
         ttk.Checkbutton(
-            opt, text="开机启动（登录后自动在后台运行）",
+            opt, text="开机启动",
             variable=self.var_autostart,
             command=self.on_autostart_ui).pack(anchor="w", padx=8, pady=(6, 2))
         self.var_trust = tk.BooleanVar(value=True)
@@ -1308,6 +1827,16 @@ class LoaderApp:
         ToolTip(trust_cb,
                 "勾选后打开 Excel 不再弹出“禁用宏/启用内容”安全提示；"
                 "不勾选也可以长期启动，但打开 Excel 时可能需手动点一次“启用内容”。")
+        self.var_force = tk.BooleanVar(
+            value=bool(read_prefs().get(FORCE_PREF_KEY, False)))
+        force_cb = ttk.Checkbutton(
+            opt, text="卸载时允许强制结束进程",
+            variable=self.var_force,
+            command=lambda: write_pref(FORCE_PREF_KEY, self.var_force.get()))
+        force_cb.pack(anchor="w", padx=8, pady=(2, 2))
+        ToolTip(force_cb,
+                "高级选项：默认关闭。等待 Excel 自行退出超时后不再二次确认，"
+                "直接强制结束；长期启动前的关闭流程同样适用。")
 
         listf = ttk.LabelFrame(root, text=" 加载项 ")
         listf.pack(fill="x", padx=12, pady=6)
@@ -1343,6 +1872,8 @@ class LoaderApp:
         self.log.pack(fill="both", expand=True, padx=6, pady=6)
 
         self.append_log("装载器已启动，发现 %d 个自定义加载项。" % len(self.addins))
+        if STARTUP_NOTICE:
+            self.append_log(STARTUP_NOTICE)
         self.append_log("打开 Excel，等待对应选项卡出现。")
 
         root.update_idletasks()
@@ -1532,7 +2063,7 @@ class LoaderApp:
 
 
     def show_about(self, auto_close=False):
-        """关于窗：含两种启动模式对比表，发布页按钮打开仓库发布页。"""
+        """关于窗：含两种启动模式对比表，发布页与检查更新按钮。"""
         dlg = tk.Toplevel(self.root)
         dlg.title("关于")
         dlg.transient(self.root)
@@ -1667,10 +2198,12 @@ class LoaderApp:
                      text="%s  [%s]" % (os.path.basename(path), src)).grid(
                 row=0, column=1, sticky="w", padx=4)
 
+            trust, _why = trust_state(path)
+            state = ("已登记" if reg else "未登记") + "·" + TRUST_LABELS[trust]
             tk.Label(row, anchor="w", font=("Microsoft YaHei", 8),
-                     fg="#1a6b1a" if reg else "#999999",
-                     text="已登记" if reg else "未登记").grid(
-                row=0, column=2, sticky="w", padx=6)
+                     fg="#1a6b1a" if trust in (TRUST_TRUSTED, TRUST_SESSION) else (
+                         "#c0392b" if trust == TRUST_DENIED else "#8a6d00"),
+                     text=state).grid(row=0, column=2, sticky="w", padx=6)
             ttk.Button(row, text="卸载" if reg else "长期启动", width=10,
                        command=lambda p=path, r=reg: (
                            self.on_unregister(p) if r else self.on_register(p)
@@ -1688,6 +2221,7 @@ class LoaderApp:
                 self.deselected.discard(n)
             else:
                 self.deselected.add(n)
+        self.sync_autostart_with_targets()
 
     def get_targets(self):
         with self.lock:
@@ -1698,7 +2232,8 @@ class LoaderApp:
                     items.append((p, "临时启动"))
                     known.add(norm_path(p))
             return [p for p, _ in items
-                    if registered_at(p) or norm_path(p) not in self.deselected]
+                    if (registered_at(p) or norm_path(p) not in self.deselected)
+                    and xlam_allowed(p)[0]]
 
     @staticmethod
     def _sig(items):
@@ -1715,6 +2250,7 @@ class LoaderApp:
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
         self.set_initial_status()
         self.refresh_install_state()
+        self.sync_autostart_with_targets()
 
     def auto_discover(self):
         """定期刷新：注册表/目录变化后自动刷新窗口列表。"""
@@ -1744,11 +2280,15 @@ class LoaderApp:
             if norm_path(path) not in known:
                 self.extra.append(path)
             self.deselected.discard(norm_path(path))
+        mark_session_trusted(path)
+        _SKIP_LOGGED.discard(norm_path(path))
         self.kick.set()
         self.build_list()
         self.set_initial_status()
-        self.append_log("已选择 %s，正在临时装载（装载器退出或取消勾选后失效，未写注册表）"
-                        % os.path.basename(path))
+        note = ("；该文件不在 Excel 受信任位置，按会话临时信任装载"
+                if not is_auto_trusted(path) else "")
+        self.append_log("已选择 %s，正在临时装载（装载器退出或取消勾选后失效，未写注册表%s）"
+                        % (os.path.basename(path), note))
 
     def register_pick(self):
         path = filedialog.askopenfilename(
@@ -1758,21 +2298,95 @@ class LoaderApp:
         if path:
             self.on_register(path)
 
-    def on_register(self, path):
-        if is_excel_running():
-            if not messagebox.askokcancel(
-                "关闭 Excel",
-                "长期启动需先关闭所有 Excel。\n"
-                "点“确定”由装载器强制关闭，未保存的内容会丢失。",
+    def _wait_excel_close(self, reason):
+        """提示保存并轮询等待 Excel 退出。True=已退出，False=取消，'timeout'=超时。"""
+        result = {"value": None}
+        dlg = tk.Toplevel(self.root)
+        dlg.title("关闭 Excel")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+
+        def finish(value):
+            tid = timer["id"]
+            if tid is not None:
+                try:
+                    dlg.after_cancel(tid)
+                except tk.TclError:
+                    pass
+            result["value"] = value
+            dlg.destroy()
+
+        frame = ttk.Frame(dlg, padding=(16, 12))
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text=reason, wraplength=390,
+                  justify="left").pack(anchor="w")
+        ttk.Label(frame, text="请先保存工作并关闭所有 Excel 窗口。Excel 退出时会写回加载项状态，"
+                  "所以这一步不能跳过。", wraplength=390, justify="left",
+                  foreground="#8a6d00").pack(anchor="w", pady=(8, 0))
+        lbl = tk.Label(frame, anchor="w", font=("Consolas", 9),
+                       foreground="#555555")
+        lbl.pack(anchor="w", fill="x", pady=(10, 2))
+        bf = ttk.Frame(frame)
+        bf.pack(fill="x", pady=(8, 0))
+        ttk.Button(bf, text="我已关闭", width=10,
+                   command=lambda: check()).pack(side="right")
+        ttk.Button(bf, text="取消", width=10,
+                   command=lambda: finish(False)).pack(side="right", padx=(8, 0))
+
+        timer = {"id": None}
+        deadline = time.monotonic() + EXCEL_CLOSE_TIMEOUT
+
+        def check():
+            if not is_excel_running():
+                finish(True)
+                return
+            left = max(0, int(deadline - time.monotonic() + 0.999))
+            lbl["text"] = "剩余 %d 秒 ｜ 仍检测到 Excel 运行" % left
+            if left <= 0:
+                finish("timeout")
+                return
+            timer["id"] = dlg.after(EXCEL_CLOSE_POLL_MS, check)
+
+        dlg.protocol("WM_DELETE_WINDOW", lambda: finish(False))
+        dlg.grab_set()
+        check()
+        self.root.wait_window(dlg)
+        return result["value"]
+
+    def ensure_excel_closed(self, action):
+        """返回 True 可继续；默认等用户保存，超时必须确认才强制结束。"""
+        if not is_excel_running():
+            return True
+        state = self._wait_excel_close("%s前需要关闭 Excel。" % action)
+        if state is True:
+            self.append_log("Excel 已自行退出，可以继续%s。" % action)
+            return True
+        if state is False:
+            self.append_log("%s已取消：Excel 仍在运行。" % action)
+            return False
+        if not self.var_force.get():
+            if not messagebox.askyesno(
+                "Excel 未退出",
+                "等待 %d 秒后仍检测到 Excel 运行。\n"
+                "检测到 Excel 可能回写加载项状态，是否强制结束？\n"
+                "强制结束会丢失未保存的内容。" % EXCEL_CLOSE_TIMEOUT,
                 parent=self.root,
             ):
-                self.append_log("长期启动已取消")
-                return
-            n = close_excel_processes()
-            self.append_log("已强制关闭 %d 个 Excel 进程" % n)
-            if is_excel_running():
-                self.append_log("长期启动失败：Excel 仍在运行，请手动关闭后重试")
-                return
+                self.append_log("%s已取消：用户未允许强制结束 Excel。" % action)
+                return False
+        else:
+            self.append_log("等待 %d 秒超时，按高级选项直接强制结束 Excel。"
+                            % EXCEL_CLOSE_TIMEOUT)
+        n = close_excel_processes()
+        self.append_log("已强制关闭 %d 个 Excel 进程" % n)
+        if is_excel_running():
+            self.append_log("%s失败：Excel 仍在运行，请手动关闭后重试。" % action)
+            return False
+        return True
+
+    def on_register(self, path):
+        if not self.ensure_excel_closed("长期启动"):
+            return
         # 源路径若已直接登记，先撤销，避免副本与源留下两条 OPEN
         if registered_at(path):
             unregister_addin(path)
@@ -1809,30 +2423,33 @@ class LoaderApp:
                 self.extra.append(copy)
             self.deselected.discard(norm_path(copy))
         # 同步装载当前 Excel，不等下次启动（卸载侧已有同样的同步兜底）
-        for hwnd in find_excel_doc_windows():
-            app = get_excel_app(hwnd)
-            if app is not None:
-                provision(app, hwnd, copy)
+        trust_ok = is_auto_trusted(copy)
+        if trust_ok:
+            for hwnd in find_excel_doc_windows():
+                app = get_excel_app(hwnd)
+                if app is not None:
+                    provision(app, hwnd, copy)
+        else:
+            self.append_log("警告：管理目录未加入 Excel 受信任位置，%s 已登记但不会自动装载；"
+                            "请在选项区勾选受信任位置" % os.path.basename(copy))
         self.kick.set()
         self.refresh()
-        self.append_log("已长期启动 %s（%s，%s，登记 %s），当前 Excel 已装载，下次启动自动加载"
-                        % (os.path.basename(path), how, trust_note, msg))
+        self.append_log("已长期启动 %s（%s，%s，登记 %s）%s"
+                        % (os.path.basename(path), how, trust_note, msg,
+                           "，当前 Excel 已装载，下次启动自动加载" if trust_ok else ""))
 
     def on_unregister(self, path):
         name = os.path.basename(path)
         if not messagebox.askyesno(
             "确认卸载",
             "卸载 %s 将撤销 Excel 加载项登记、删除加载项目录中的副本。\n"
-            "若 Excel 正在运行，将由装载器强制关闭（未保存内容会丢失）。\n确定继续？" % name,
+            "若 Excel 正在运行，会先提示你保存并关闭；等待超时后才询问是否强制结束。\n"
+            "确定继续？" % name,
             parent=self.root,
         ):
             return
-        if is_excel_running():
-            n = close_excel_processes()
-            self.append_log("已强制关闭 %d 个 Excel 进程" % n)
-            if is_excel_running():
-                self.append_log("卸载失败：Excel 仍在运行，请手动关闭后重试")
-                return
+        if not self.ensure_excel_closed("卸载"):
+            return
         ok, msg = unregister_addin(path)
         if not ok:
             self.append_log("卸载 %s 失败：%s" % (name, msg))
@@ -1854,6 +2471,7 @@ class LoaderApp:
                         % (name,
                            "，加载项列表记录已清除" if cleared else "",
                            "，目录副本已删除" if removed else ""))
+        self.sync_autostart_with_targets()
         # 延迟复查：防止登记/加载状态被写回
         self.root.after(3000, lambda: self._verify_unloaded(path))
 
@@ -1871,11 +2489,12 @@ class LoaderApp:
             if app is None:
                 continue
             target = norm_path(path)
-            wb = _TEMP_WBS.pop((int(hwnd), target), None)
+            wb = workbook_by_name(app, os.path.basename(path))
             if wb is not None:
                 try:
-                    wb.Close(SaveChanges=False)
-                    fixed.append("临时装载")
+                    if norm_path(wb.FullName) == target:
+                        wb.Close(SaveChanges=False)
+                        fixed.append("临时装载")
                 except Exception:
                     pass
             for i in range(1, app.AddIns.Count + 1):
@@ -1960,6 +2579,17 @@ class LoaderApp:
         elif cmd == ID_EXIT:
             self.exit_app()
 
+    def sync_autostart_with_targets(self):
+        """目标为空时自动取消开机启动：取消勾选或文件删除都会走到这里。"""
+        if not is_autostart():
+            return
+        if time.monotonic() - self.started_at < AUTOSTART_GRACE:
+            return
+        if self.get_targets():
+            return
+        self._apply_autostart(False)
+        self.append_log("没有可装载的加载项，已自动取消开机启动")
+
     def _apply_autostart(self, want):
         """统一写入开机启动状态，并回读同步主界面勾选框与托盘菜单。"""
         try:
@@ -2022,6 +2652,7 @@ class LoaderApp:
 
     # ---- 日志/轮询 ----
     def append_log(self, text):
+        write_run_log(text)
         self.log_lines.append(text)
         self.log.configure(state="normal")
         self.log.delete("1.0", "end")
@@ -2061,6 +2692,17 @@ class LoaderApp:
         if now - self.last_discover >= DISCOVER_INTERVAL:
             self.last_discover = now
             self.auto_discover()
+        if now - self.last_autostart_check >= AUTOSTART_CHECK_SEC:
+            self.last_autostart_check = now
+            try:
+                note = autostart_health_fix()
+                if note:
+                    self.append_log(note)
+                    self.var_autostart.set(is_autostart())
+                    self.refresh_state_text()
+            except Exception as exc:
+                self.append_log("开机启动自检失败：%s" % exc)
+            self.sync_autostart_with_targets()
         self.root.after(120, self.poll)
 
 
@@ -2073,6 +2715,7 @@ def parse_fixed(argv):
 
 
 def main():
+    global STARTUP_NOTICE
     argv = sys.argv[1:]
     fixed = parse_fixed(argv)
     if "--selfcheck" in argv:
@@ -2089,9 +2732,24 @@ def main():
         print(run_one_click_update(target, dry_run=dry))
         sys.exit(0)
 
+    notice_takeover = ""
+    try:
+        notice_takeover = take_over_older_instances() or ""
+    except Exception as exc:
+        notice_takeover = "版本仲裁失败：%s" % exc
+
     _mutex, first = acquire_single_instance()
     if not first:
         sys.exit(0)
+
+    notices = [n for n in (notice_takeover,) if n]
+    try:
+        boot = migrate_autostart() or autostart_health_fix() or ""
+        if boot:
+            notices.append(boot)
+    except Exception as exc:
+        notices.append("开机启动自检失败：%s" % exc)
+    STARTUP_NOTICE = "；".join(notices)
 
     root = tk.Tk()
     LoaderApp(root, fixed, background=("--background" in argv))

@@ -1,0 +1,7 @@
+# AddInLoader 运行时依赖
+# 导出：2026-11-23，取自 venv_build 实际安装版本
+# 重建：py -3.12 -m venv venv_build
+#      venv_build\Scripts\python -m pip install -r requirements.txt
+# 打包工具见 requirements-dev.txt
+
+comtypes==1.5.0
