@@ -1,6 +1,6 @@
-# AddInLoader v1.0.1
+# AddInLoader v1.0.2
 
-[![Release v1.0.1](https://img.shields.io/badge/Release-v1.0.1-217346)](https://github.com/YehOlt/AddInLoader/releases)
+[![Release v1.0.2](https://img.shields.io/badge/Release-v1.0.2-217346)](https://github.com/YehOlt/AddInLoader/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-217346)](https://github.com/YehOlt/AddInLoader/blob/main/LICENSE)
 ![Platform Windows](https://img.shields.io/badge/Platform-Windows-0078D6?logo=windows&logoColor=white)
 ![Excel 加载项](https://img.shields.io/badge/Excel-%E5%8A%A0%E8%BD%BD%E9%A1%B9-217346?logo=microsoftexcel&logoColor=white)

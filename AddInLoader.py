@@ -40,9 +40,11 @@ v1.0.1 安全加固：
   7. 开机启动改为计划任务 ONLOGON + /IT + /RL HIGHEST；旧 Run 键自动迁移，
      任务路径/权限异常自修复，程序文件或加载目标消失时自动取消。
 
+v1.0.2 修复：
+  受信任位置登记/撤销后即时清除信任缓存，界面状态与日志不再滞后 30 秒。
+
 通道：oleacc!AccessibleObjectFromWindow(OBJID_NATIVEOM) 取 Excel Application，
-微软文档化的 Office Native OM 附着方式；不挂钩子、不注入、不写 HKLM、
-不进计划任务。
+微软文档化的 Office Native OM 附着方式；不挂钩子、不注入、不写 HKLM。
 
 用法：
   AddInLoader.exe                 图形界面
@@ -51,7 +53,7 @@ v1.0.1 安全加固：
   AddInLoader.exe --xlam <路径>   仅装载指定 xlam（排障用，跳过自动发现）
 """
 # 版本信息（统一在此维护，随版本更新）
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 
 import ctypes
 import base64
@@ -469,6 +471,7 @@ def ensure_trusted_location():
                 except OSError:
                     continue
                 if val and norm_path(os.path.expandvars(val)) == norm_path(target):
+                    _TRUST_CACHE["ts"] = 0.0
                     return False, "已受信任"
             max_n = -1
             for sub in subs:
@@ -483,6 +486,7 @@ def ensure_trusted_location():
                                   "AddInLoader 加载项目录")
             finally:
                 winreg.CloseKey(sk)
+            _TRUST_CACHE["ts"] = 0.0
             return True, "%s\\%s" % (ver, name)
         except OSError as exc:
             return False, str(exc)
@@ -526,6 +530,8 @@ def remove_trusted_location():
                         pass
         finally:
             winreg.CloseKey(key)
+    if removed:
+        _TRUST_CACHE["ts"] = 0.0
     return removed
 
 
