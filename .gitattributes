@@ -1,0 +1,13 @@
+# 归档导出（GitHub Source code zip/tar.gz）只保留程序源码与升级日志。
+# 仅影响归档导出；仓库网页与 raw 下载保留全部文件。
+.gitattributes export-ignore
+.gitignore export-ignore
+LICENSE export-ignore
+README.md export-ignore
+requirements.txt export-ignore
+requirements-dev.txt export-ignore
+update.json export-ignore
+screenshots/ export-ignore
+tests/ export-ignore
+*.exe export-ignore
+AddInLoader_v*/ export-ignore
