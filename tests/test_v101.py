@@ -315,8 +315,11 @@ def test_version_arbitration():
     with patched(m, "_legacy_run_value", lambda: '"%s" --background' % OLDER):
         with patched(m, "_remove_legacy_run", lambda: fired.append("run")):
             with patched(m, "task_info", lambda: None):
-                notes = m.clear_lower_autostart([OLDER])
-    check("清除指向低版本的旧 Run 键", "run" in fired and "旧注册表启动项" in notes)
+                with patched(m, "set_autostart", lambda v: fired.append("set:%s" % v)):
+                    notes = m.clear_lower_autostart([OLDER])
+    check("清除指向低版本的旧 Run 键并重建",
+          "run" in fired and "set:True" in fired
+          and "旧启动项已改指向当前版本" in notes)
 
     fired = []
     with patched(m, "_legacy_run_value", lambda: None):
@@ -548,67 +551,47 @@ def test_silent_update():
         def after(self, _ms, fn):
             self.jobs.append(fn)
 
-    def run_silent(tag, url, err, answer=True):
-        calls, asks, logs = [], [], []
-        root = JobRoot()
-        stub = object.__new__(m.LoaderApp)
-        stub.root = root
-        stub.append_log = logs.append
-        with patched(m, "fetch_latest_release", lambda: (tag, url, err)), \
-                patched(m.threading, "Thread", SyncThread), \
-                patched(m.messagebox, "askyesno",
-                        lambda *_a, **_k: asks.append(True) or answer), \
-                patched(m.webbrowser, "open", lambda u: calls.append(u)):
-            m.LoaderApp.silent_check_update(stub)
-            root.jobs.pop(0)()
-        return calls, asks, logs
-
-    check("静默检查-无更新不弹窗不打开但记录日志",
-          run_silent("v" + m.VERSION, "https://x", None)
-          == ([], [], ["未发现新版本，当前版本 v%s。" % m.VERSION]))
-    check("静默检查-失败不弹窗不打开但记录日志",
-          run_silent("v2.0.0", "https://x", "网络失败")
-          == ([], [], ["检查更新失败：网络失败"]))
-    check("静默检查-有新版弹窗确认后打开并记录日志",
-          run_silent("v2.0.0", "https://new", None, True)
-          == (["https://new"], [True],
-              ["发现新版本 v2.0.0，当前版本 v%s。" % m.VERSION,
-               "确认前往发布页：v2.0.0", "打开发布页 https://new"]))
-    check("静默检查-有新版取消则不打开但记录日志",
-          run_silent("v2.0.0", "https://new", None, False)
-          == ([], [True],
-              ["发现新版本 v2.0.0，当前版本 v%s。" % m.VERSION,
-               "取消前往发布页：v2.0.0"]))
-
-    def run_manual(tag, url, err, answer=True):
-        calls, asks, logs, runs, infos = [], [], [], [], []
+    def run_check(silent, manifest, err, choice="skip"):
+        calls, choices, logs, infos, downloaded = [], [], [], [], []
         root = JobRoot()
         stub = object.__new__(m.LoaderApp)
         stub.root = root
         stub.append_log = logs.append
         stub.open_release_page = lambda u: calls.append(u)
-        with patched(m, "fetch_latest_release", lambda: (tag, url, err)), \
+        stub._handle_update_found = lambda parent, man, latest: choices.append(latest)
+        with patched(m, "fetch_update_manifest", lambda: (manifest, err)), \
                 patched(m.threading, "Thread", SyncThread), \
-                patched(m.messagebox, "askyesno",
-                        lambda *_a, **_k: asks.append(True) or answer), \
+                patched(m.messagebox, "askyesno", lambda *a, **k: False), \
                 patched(m.messagebox, "showinfo", lambda *a, **k: infos.append(a)):
-            m.LoaderApp.check_for_update(stub, root)
+            if silent:
+                m.LoaderApp.silent_check_update(stub)
+            else:
+                m.LoaderApp.check_for_update(stub, root)
             root.jobs.pop(0)()
-        return calls, logs, runs, infos
+        return calls, choices, logs, infos
 
-    check("手动检查-无新版记录未发现新版本",
-          run_manual("v" + m.VERSION, "https://x", None)[1]
-          == ["未发现新版本，当前版本 v%s。" % m.VERSION])
-    check("手动检查-确认后打开发布页并记录日志",
-          run_manual("v2.0.0", "https://new", None, True)[:2]
-          == (["https://new"],
-              ["发现新版本 v2.0.0，当前版本 v%s。" % m.VERSION,
-               "确认前往发布页：v2.0.0"]))
-    check("手动检查-取消则不打开并记录日志",
-          run_manual("v2.0.0", "https://new", None, False)[:2]
-          == ([],
-              ["发现新版本 v2.0.0，当前版本 v%s。" % m.VERSION,
-               "取消前往发布页：v2.0.0"]))
+    latest = {"version": "v2.0.0", "exe": "AddInLoader_v2.0.0.exe",
+              "sha256": "0" * 64, "url": "https://x/a.exe"}
+
+    check("静默检查-无更新不打扰但记日志",
+          run_check(True, {"version": "v" + m.VERSION}, None)
+          == ([], [], ["当前已是最新版 v%s。" % m.VERSION], []))
+    check("静默检查-失败不打扰但记日志",
+          run_check(True, None, "网络失败")
+          == ([], [], ["检查更新失败：网络失败"], []))
+    check("静默检查-有新版走三选一分派",
+          run_check(True, latest, None)[1] == ["v2.0.0"])
+    check("手动检查-无新版弹提示",
+          run_check(False, {"version": "v" + m.VERSION}, None)[3] != [])
+    check("手动检查-失败弹确认窗",
+          "检查更新失败" in "".join(run_check(False, None, "网络失败")[2]))
+    check("手动检查-有新版同样走三选一",
+          run_check(False, latest, None)[1] == ["v2.0.0"])
+    with open(SRC, encoding="utf-8") as _f:
+        _src_text = _f.read()
+    check("静默与手动共用同一实现",
+          "self.check_for_update(self.root, silent=True)" in _src_text
+          and "def check_for_update(self, parent, silent=False):" in _src_text)
 
     # open_release_page：URL 为空回退默认发布页，且始终写日志
     opened = []
@@ -652,18 +635,18 @@ def test_api_upgrade_all_versions():
         check("%s 含 API 清单入口" % rel,
               'MANIFEST_API = "https://api.github.com/repos/' in src
               and "base64.b64decode(envelope" in src)
-        check("%s 无一键升级模块" % rel,
+        check("%s 无旧式一键升级模块" % rel,
               "def run_upgrade" not in src
-              and "def download_file" not in src
               and "def write_upgrade_bat" not in src
-              and "def start_upgrade_bat" not in src
-              and "_UPDATE_ASSET" not in src
-              and "octet-stream" not in src
-              and "代理" not in src)
-        check("%s 保留静默检查与发布页引导" % rel,
+              and "def start_upgrade_bat" not in src)
+        check("%s 保留静默检查与三选一更新" % rel,
               "def silent_check_update(self):" in src
               and "def open_release_page(self, url):" in src
-              and "是否前往发布页下载？" in src)
+              and "def ask_update_choice(self, parent, latest):" in src
+              and 'text="直接下载"' in src
+              and 'text="发布页"' in src
+              and 'text="暂不更新"' in src
+              and "是否前往发布页下载？" not in src)
 
 
 def test_trust_cache_invalidation():
@@ -708,6 +691,28 @@ def test_trust_cache_invalidation():
         check("remove_trusted 删除后清缓存", m._TRUST_CACHE["ts"] == 0.0)
 
 
+def test_trust_option_removed_in_v103():
+    """v1.0.3 去掉受信任位置勾选框，长期启动无条件登记；历史版本保留原样。"""
+    base = os.path.dirname(SRC)
+    v103 = open(SRC, encoding="utf-8").read()
+    check("v1.0.3 无受信任位置勾选框",
+          "var_trust" not in v103 and "将管理目录加入" not in v103)
+    check("v1.0.3 长期启动无条件登记受信任位置",
+          "trusted_ok, trusted_msg = ensure_trusted_location()" in v103
+          and v103.count("if self.var_trust.get():") == 0)
+    check("v1.0.3 登记失败不中止长期启动",
+          "受信任位置登记失败（%s）；" in v103
+          and "加载项仍会登记" in v103
+          and 'trust_note = "未加入受信任位置"' in v103)
+    check("v1.0.3 版本号为 1.0.3", 'VERSION = "1.0.3"' in v103)
+    for rel in ("AddInLoader_v1.0.0_InitialRelease/AddInLoader_v1.0.0.py",
+                "AddInLoader_v1.0.1_P0SecurityFix/AddInLoader_v1.0.1.py",
+                "AddInLoader_v1.0.2_TrustCacheFix/AddInLoader_v1.0.2.py"):
+        src = open(os.path.join(base, rel), encoding="utf-8").read()
+        check("%s 仍保留勾选框（历史版本不改）" % rel,
+              "var_trust" in src and "将管理目录加入" in src)
+
+
 if __name__ == "__main__":
     test_trust_states()
     test_trust_cache_invalidation()
@@ -720,4 +725,5 @@ if __name__ == "__main__":
     test_upgrade_flow()
     test_silent_update()
     test_api_upgrade_all_versions()
+    test_trust_option_removed_in_v103()
     print("\nALL PASS: %d checks" % len(PASS))

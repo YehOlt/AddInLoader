@@ -53,7 +53,7 @@ v1.0.2 修复：
   AddInLoader.exe --xlam <路径>   仅装载指定 xlam（排障用，跳过自动发现）
 """
 # 版本信息（统一在此维护，随版本更新）
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 
 import ctypes
 import base64
@@ -1825,14 +1825,6 @@ class LoaderApp:
             opt, text="开机启动",
             variable=self.var_autostart,
             command=self.on_autostart_ui).pack(anchor="w", padx=8, pady=(6, 2))
-        self.var_trust = tk.BooleanVar(value=True)
-        trust_cb = ttk.Checkbutton(
-            opt, text="将管理目录加入 Excel 受信任位置（推荐）",
-            variable=self.var_trust)
-        trust_cb.pack(anchor="w", padx=8, pady=(2, 6))
-        ToolTip(trust_cb,
-                "勾选后打开 Excel 不再弹出“禁用宏/启用内容”安全提示；"
-                "不勾选也可以长期启动，但打开 Excel 时可能需手动点一次“启用内容”。")
         self.var_force = tk.BooleanVar(
             value=bool(read_prefs().get(FORCE_PREF_KEY, False)))
         force_cb = ttk.Checkbutton(
@@ -2400,15 +2392,14 @@ class LoaderApp:
         if not copy:
             self.append_log("长期启动 %s 失败：%s" % (os.path.basename(path), how))
             return
-        if self.var_trust.get():
-            trusted_ok, trusted_msg = ensure_trusted_location()
-            if not trusted_ok and trusted_msg != "已受信任":
-                self.append_log("长期启动 %s 失败：受信任位置登记失败（%s）"
-                                % (os.path.basename(path), trusted_msg))
-                return
-            trust_note = "已加入受信任位置"
-        else:
+        trusted_ok, trusted_msg = ensure_trusted_location()
+        if not trusted_ok and trusted_msg != "已受信任":
+            self.append_log("警告：长期启动 %s 的受信任位置登记失败（%s）；"
+                            "加载项仍会登记，但 Excel 不会自动装载，状态显示为未受信任"
+                            % (os.path.basename(path), trusted_msg))
             trust_note = "未加入受信任位置"
+        else:
+            trust_note = "已加入受信任位置"
         ok, msg = register_addin(copy)
         if not ok:
             self.append_log("长期启动 %s 失败：%s" % (os.path.basename(path), msg))
@@ -2437,7 +2428,7 @@ class LoaderApp:
                     provision(app, hwnd, copy)
         else:
             self.append_log("警告：管理目录未加入 Excel 受信任位置，%s 已登记但不会自动装载；"
-                            "请在选项区勾选受信任位置" % os.path.basename(copy))
+                            "请检查 Excel 受信任位置设置" % os.path.basename(copy))
         self.kick.set()
         self.refresh()
         self.append_log("已长期启动 %s（%s，%s，登记 %s）%s"

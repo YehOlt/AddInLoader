@@ -1,9 +1,9 @@
 {
-  "version": "v1.0.2",
-  "page": "https://github.com/YehOlt/AddInLoader/releases/tag/v1.0.2",
-  "pub_date": "2026-11-24T10:16:48Z",
-  "exe": "AddInLoader_v1.0.2.exe",
-  "sha256": "62b02a7039a90fe9e0bb1a309ad9a26ee7c0634e31b9754d8606941310dd1983",
-  "size": 12487908,
-  "url": "https://github.com/YehOlt/AddInLoader/releases/download/v1.0.2/AddInLoader_v1.0.2.exe?v=1102"
+  "version": "v1.0.3",
+  "page": "https://github.com/YehOlt/AddInLoader/releases/tag/v1.0.3",
+  "pub_date": "2026-11-25T10:09:52Z",
+  "exe": "AddInLoader_v1.0.3.exe",
+  "sha256": "a99d1218ea6fde7d8ee097acdb9b7abad871d6247dc3f6dfa6306d8732e199ef",
+  "size": 12489195,
+  "url": "https://github.com/YehOlt/AddInLoader/releases/download/v1.0.3/AddInLoader_v1.0.3.exe?v=1103"
 }
