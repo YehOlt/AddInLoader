@@ -43,6 +43,10 @@ v1.0.1 安全加固：
 v1.0.2 修复：
   受信任位置登记/撤销后即时清除信任缓存，界面状态与日志不再滞后 30 秒。
 
+v1.0.4 新增：
+  「清除未勾选」按钮：把已取消勾选的临时启动项从 Excel 即时卸载，并移除
+  临时启动记录、撤销会话信任；不删除文件、不影响长期启动项，无需重启。
+
 通道：oleacc!AccessibleObjectFromWindow(OBJID_NATIVEOM) 取 Excel Application，
 微软文档化的 Office Native OM 附着方式；不挂钩子、不注入、不写 HKLM。
 
@@ -53,7 +57,7 @@ v1.0.2 修复：
   AddInLoader.exe --xlam <路径>   仅装载指定 xlam（排障用，跳过自动发现）
 """
 # 版本信息（统一在此维护，随版本更新）
-VERSION = "1.0.3"
+VERSION = "1.0.4"
 
 import ctypes
 import base64
@@ -637,6 +641,13 @@ def xlam_allowed(path):
     """路径层判据（不含运行时的同名异路径态），返回 (是否允许, 原因)。"""
     state, why = trust_state(path)
     return state in (TRUST_SESSION, TRUST_TRUSTED), why
+
+
+def unchecked_temp_paths(extra, deselected, registered=None):
+    """从临时启动项里筛出已取消勾选、且未登记为长期启动的路径。"""
+    is_registered = registered or registered_at
+    return [p for p in extra
+            if norm_path(p) in deselected and not is_registered(p)]
 
 
 def _read_managed():
@@ -1787,6 +1798,12 @@ class LoaderApp:
         self.btn_pick = ttk.Button(btnf, text="临时启动",
                                    command=self.choose_xlam, width=12)
         self.btn_pick.pack(side="left")
+        self.btn_clear = ttk.Button(btnf, text="清除未勾选",
+                                    command=self.clear_unchecked_temp, width=12)
+        self.btn_clear.pack(side="left", padx=6)
+        ToolTip(self.btn_clear,
+                "关闭已取消勾选的临时启动加载项，移出临时列表并撤销会话信任。"
+                "不删除文件、不影响长期启动项。")
         self.btn_refresh = ttk.Button(btnf, text="刷新", command=self.refresh,
                                       width=11)
         self.btn_refresh.pack(side="left", padx=6)
@@ -1890,7 +1907,7 @@ class LoaderApp:
         if self.background:
             self.hide_to_tray()
         elif is_autostart():
-            self.append_log("已设为开机启动（可在“选项”区取消）。")
+            self.append_log("已设为开机启动（可在「选项」区取消）。")
 
     def open_managed_dir(self):
         """在资源管理器中打开管理目录，不存在则先创建。"""
@@ -1937,7 +1954,6 @@ class LoaderApp:
         dlg.title("发现新版本")
         dlg.transient(parent)
         dlg.resizable(False, False)
-        dlg.grab_set()
 
         def close(choice):
             chosen["value"] = choice
@@ -1950,10 +1966,10 @@ class LoaderApp:
         ttk.Label(page, text="\n请选择处理方式：", anchor="w").pack(anchor="w")
         row = ttk.Frame(page)
         row.pack(pady=(14, 0), fill="x")
-        ttk.Button(row, text="直接下载", width=12,
-                   command=lambda: close("download")).pack(side="left")
         ttk.Button(row, text="发布页", width=10,
-                   command=lambda: close("page")).pack(side="left", padx=(8, 0))
+                   command=lambda: close("page")).pack(side="left")
+        ttk.Button(row, text="直接下载", width=12,
+                   command=lambda: close("download")).pack(side="left", padx=(8, 0))
         ttk.Button(row, text="暂不更新", width=10,
                    command=lambda: close("skip")).pack(side="left", padx=(8, 0))
 
@@ -1963,6 +1979,7 @@ class LoaderApp:
         x = parent.winfo_rootx() + (parent.winfo_width() - dlg.winfo_width()) // 2
         y = parent.winfo_rooty() + (parent.winfo_height() - dlg.winfo_height()) // 2
         dlg.geometry("+%d+%d" % (max(x, 0), max(y, 0)))
+        dlg.grab_set()
         dlg.wait_window()
         return chosen["value"]
 
@@ -1979,16 +1996,26 @@ class LoaderApp:
         else:
             self.append_log("选择暂不更新：%s" % latest)
 
-    def check_for_update(self, parent, silent=False):
+    def check_for_update(self, parent, silent=False, report=None):
         """检查更新：手动按钮与启动检查共用。清单校验 → 三选一。
 
-        silent=True 时抑制「已是最新版」与失败弹窗，发现新版照常三选一。
+        「已是最新版」只写日志、不弹说明窗；没有日志面板的调用方（关于窗）
+        传 report 回调，把进度与结果写在自己的状态行上。silent=True（启动
+        检查）连失败询问也不弹，发现新版照常三选一。
         """
         box = queue.Queue()
+
+        def say(text):
+            if report:
+                try:
+                    report(text)
+                except tk.TclError:
+                    pass  # 调用方的窗口已关闭
 
         def worker():
             box.put(fetch_update_manifest())
 
+        say("正在检查更新…")
         threading.Thread(target=worker, daemon=True).start()
 
         def poll():
@@ -1999,6 +2026,7 @@ class LoaderApp:
                 return
             if err:
                 self.append_log("检查更新失败：%s" % err)
+                say("检查更新失败：%s" % err)
                 if silent:
                     return
                 answer = messagebox.askyesno(
@@ -2011,9 +2039,7 @@ class LoaderApp:
             latest = manifest["version"]
             if compare_versions(latest, VERSION) <= 0:
                 self.append_log("当前已是最新版 v%s。" % VERSION)
-                if not silent:
-                    messagebox.showinfo(
-                        "检查更新", "当前已是最新版 v%s。" % VERSION, parent=parent)
+                say("当前已是最新版 v%s。" % VERSION)
                 return
             self.append_log("发现新版本 %s，当前版本 v%s。" % (latest, VERSION))
             self._handle_update_found(parent, manifest, latest)
@@ -2091,7 +2117,7 @@ class LoaderApp:
             ("作用范围", "装载器运行时持续装载", "下次手动打开 Excel 自动加载"),
             ("写注册表", "不写", "写 OPEN + 受信任位置"),
             ("文件处理", "直接用原文件", "复制副本到管理目录（加 AIL_ 前缀）"),
-            ("覆盖的场景", "临时用一下，不常驻", "日常手动开 Excel 时免得每次都装"),
+            ("适用场景", "临时使用，不常驻", "日常使用，免去每次手动装载"),
             ("装载器退出后", "失效", "仍然有效"),
         ]
         table = tk.Frame(page, bg="#d8e4d8", bd=1)
@@ -2121,9 +2147,12 @@ class LoaderApp:
         ttk.Button(btn_row, text="发布页",
                    command=lambda: self.open_release_page(RELEASE_PAGE_URL)
                    ).pack(side="left")
+        status = ttk.Label(page, text="", foreground="#777777", wraplength=380)
         ttk.Button(btn_row, text="检查更新",
-                   command=lambda: self.check_for_update(dlg)
+                   command=lambda: self.check_for_update(
+                       dlg, report=lambda msg: status.configure(text=msg))
                    ).pack(side="left", padx=(8, 0))
+        status.pack(pady=(8, 0))
 
         dlg.bind("<Escape>", close)
         dlg.protocol("WM_DELETE_WINDOW", close)
@@ -2288,6 +2317,39 @@ class LoaderApp:
         self.append_log("已选择 %s，正在临时装载（装载器退出或取消勾选后失效，未写注册表%s）"
                         % (os.path.basename(path), note))
 
+    def clear_unchecked_temp(self):
+        """清除已取消勾选的临时启动项：即时卸载并移出临时列表，无需重启。"""
+        with self.lock:
+            targets = list(unchecked_temp_paths(self.extra, self.deselected))
+        if not targets:
+            self.append_log("没有已取消勾选的临时启动项需要清除。")
+            return
+        names = [os.path.basename(p) for p in targets]
+        cleared = set()
+        for path in targets:
+            n = norm_path(path)
+            cleared.add(n)
+            for hwnd in find_excel_doc_windows():
+                app = get_excel_app(hwnd)
+                if app is not None:
+                    try:
+                        unload_from_excel(app, hwnd, path)
+                    except Exception as exc:
+                        self.append_log("卸载 %s 失败：%s" % (os.path.basename(path), exc))
+            self.unloadq.put(path)
+            _SESSION_TRUSTED.discard(n)
+            _SKIP_LOGGED.discard(n)
+            clear_addin_load_time(path)
+            clear_addin_manager_entry(path)
+        with self.lock:
+            self.extra = [p for p in self.extra if norm_path(p) not in cleared]
+        self.kick.set()
+        self.build_list()
+        self.set_initial_status()
+        self.append_log("已清除 %d 项未勾选的临时启动：%s"
+                        % (len(targets), "、".join(names)))
+        self.sync_autostart_with_targets()
+
     def register_pick(self):
         path = filedialog.askopenfilename(
             title="选择要长期启动的 Excel 加载项",
@@ -2319,7 +2381,7 @@ class LoaderApp:
         ttk.Label(frame, text=reason, wraplength=390,
                   justify="left").pack(anchor="w")
         ttk.Label(frame, text="请先保存工作并关闭所有 Excel 窗口。Excel 退出时会写回加载项状态，"
-                  "所以这一步不能跳过。", wraplength=390, justify="left",
+                  "此步骤不可跳过。", wraplength=390, justify="left",
                   foreground="#8a6d00").pack(anchor="w", pady=(8, 0))
         lbl = tk.Label(frame, anchor="w", font=("Consolas", 9),
                        foreground="#555555")

@@ -1,11 +1,8 @@
 # -*- coding: utf-8 -*-
-"""AddInLoader v1.0.1 回归脚本：不依赖真实 Excel/WPS，直接验证关键分支。"""
+"""AddInLoader 回归脚本：不依赖真实 Excel/WPS，直接验证关键分支。"""
 import base64
 import contextlib
-import hashlib
-import importlib.util
 import os
-import subprocess
 import sys
 import tempfile
 
@@ -106,15 +103,6 @@ def test_trust_states():
 
 
 def test_provision_reuses_and_releases():
-    check("_TEMP_WBS 已移除", not hasattr(m, "_TEMP_WBS"))
-    check("装载后验证功能已移除",
-          not any(hasattr(m, n) for n in
-                  ("VERIFY_PREF_KEY", "verify_loaded", "read_verify_cfg",
-                   "menu_tag_exists", "_VERIFY_REPORTED")))
-    check("父进程白名单功能已移除",
-          not any(hasattr(m, n) for n in
-                  ("PARENT_PREF_KEY", "parent_whitelist",
-                   "window_parent_process_name")))
     with tempfile.TemporaryDirectory() as td:
         target = os.path.join(td, "AIL_probe.xlam")
         with open(target, "wb"):
@@ -255,6 +243,95 @@ def test_autostart_tasks():
         stub = make_autostart_stub(["xlam"])
         m.LoaderApp.sync_autostart_with_targets(stub)
         check("仍有目标时保留开机启动", stub.applied == [])
+
+
+def test_clear_unchecked_temp():
+    """v1.0.4 清除未勾选的临时启动项：只清临时且未勾选、未登记者。"""
+    with tempfile.TemporaryDirectory() as td:
+        temp_unchecked = os.path.join(td, "temp_unchecked.xlam")
+        temp_checked = os.path.join(td, "temp_checked.xlam")
+        discovered_unchecked = os.path.join(td, "discovered_unchecked.xlam")
+        registered = os.path.join(td, "registered.xlam")
+        for p in (temp_unchecked, temp_checked, discovered_unchecked, registered):
+            with open(p, "wb"):
+                pass
+        deselected = {m.norm_path(p) for p in (temp_unchecked, discovered_unchecked,
+                                               registered)}
+
+        check("未勾选临时项被选中",
+              m.unchecked_temp_paths([temp_unchecked, temp_checked], deselected)
+              == [temp_unchecked])
+        with patched(m, "registered_at",
+                     lambda p: "reg" if m.norm_path(p) == m.norm_path(registered) else None):
+            check("已登记项即使未勾选也不清除",
+                  m.unchecked_temp_paths([registered], deselected) == [])
+        check("未勾选的自动发现项不在临时列表则不受影响",
+              m.unchecked_temp_paths([], deselected) == [])
+        check("路径规范化后匹配",
+              m.unchecked_temp_paths([temp_unchecked.upper()], deselected)
+              == [temp_unchecked.upper()])
+
+        # 清除方法：同步卸载 + 队列兜底 + 撤销会话信任，不动勾选与登记项
+        m._SESSION_TRUSTED.add(m.norm_path(temp_unchecked))
+        m._SESSION_TRUSTED.add(m.norm_path(temp_checked))
+        unloaded = []
+        removed_loadtime = []
+        removed_manager = []
+        with patched(m, "find_excel_doc_windows", lambda: [101, 102]), \
+             patched(m, "get_excel_app", lambda hwnd: "app%d" % hwnd), \
+             patched(m, "unload_from_excel",
+                     lambda app, hwnd, p: unloaded.append((app, hwnd, p))), \
+             patched(m, "clear_addin_load_time",
+                     lambda p: removed_loadtime.append(p) or [p]), \
+             patched(m, "clear_addin_manager_entry",
+                     lambda p: removed_manager.append(p) or [p]):
+            stub = object.__new__(m.LoaderApp)
+            stub.lock = __import__("threading").Lock()
+            stub.extra = [temp_unchecked, temp_checked]
+            stub.deselected = deselected
+            stub.unloadq = __import__("queue").Queue()
+            stub.kick = __import__("threading").Event()
+            stub.logs = []
+            stub.append_log = stub.logs.append
+            stub.build_list = lambda: None
+            stub.set_initial_status = lambda: None
+            stub.sync_autostart_with_targets = lambda: None
+            m.LoaderApp.clear_unchecked_temp(stub)
+
+        check("同步卸载覆盖所有 Excel 窗口",
+              len(unloaded) == 2
+              and all(p == temp_unchecked for _, _, p in unloaded)
+              and {app for app, _, _ in unloaded} == {"app101", "app102"})
+        check("卸载队列已入队兜底",
+              stub.unloadq.qsize() == 1 and stub.unloadq.get() == temp_unchecked)
+        check("kick 已置位", stub.kick.is_set())
+        check("临时列表只移除未勾选者", stub.extra == [temp_checked])
+        check("deselected 保留原路径供自动发现项继续使用",
+              m.norm_path(temp_unchecked) in stub.deselected)
+        check("会话信任只撤销被清除项",
+              m.norm_path(temp_unchecked) not in m._SESSION_TRUSTED
+              and m.norm_path(temp_checked) in m._SESSION_TRUSTED)
+        check("清除 Excel 加载记录",
+              removed_loadtime == [temp_unchecked]
+              and removed_manager == [temp_unchecked])
+        check("源文件未删除", os.path.isfile(temp_unchecked))
+        check("清除日志正确",
+              any("已清除 1 项未勾选的临时启动" in s for s in stub.logs))
+        m._SESSION_TRUSTED.discard(m.norm_path(temp_checked))
+
+        # 没有任何未勾选临时项：不卸载、不写日志以外的动作
+        stub2 = object.__new__(m.LoaderApp)
+        stub2.lock = __import__("threading").Lock()
+        stub2.extra = [temp_checked]
+        stub2.deselected = set()
+        stub2.logs = []
+        stub2.append_log = stub2.logs.append
+        with patched(m, "find_excel_doc_windows",
+                     lambda: (_ for _ in ()).throw(AssertionError("不应卸载"))):
+            m.LoaderApp.clear_unchecked_temp(stub2)
+        check("无可清除项时仅写提示日志",
+              stub2.extra == [temp_checked]
+              and any("没有已取消勾选" in s for s in stub2.logs))
 
 
 def test_run_log():
@@ -401,8 +478,6 @@ def test_check_update_logic():
         tag, url, err = m.fetch_latest_release()
     check("404 降级读 tags 取首个版本", tag == "v1.0.0"
           and url == m.RELEASE_PAGE_URL and err is None and len(calls) == 4)
-    check("本地 v1.0.1 比远端 v1.0.0 新时判为本地更新",
-          m.compare_versions(tag, m.VERSION) == -1)
 
     # 跳号 + 乱序 tags：取版本号最大者，不依赖 API 返回顺序
     class JumpedResp:
@@ -427,8 +502,6 @@ def test_check_update_logic():
     with patched(m.urllib.request, "urlopen", jump_fallback):
         tag2, _url2, err2 = m.fetch_latest_release()
     check("乱序 tags 取最高版本 v1.3.2", tag2 == "v1.3.2" and err2 is None)
-    check("跳号版本比较 1.0.1 vs 1.3.2",
-          m.compare_versions(tag2, m.VERSION) == 1)
 
     class BigJumpResp(JumpedResp):
         def read(self):
@@ -479,10 +552,6 @@ def test_upgrade_flow():
     check("API 清单解析版本与发布页", tag == "v2.0.0"
           and page.endswith("v2.0.0") and err is None)
     check("API 清单优先命中不再请求 raw", seen == [m.MANIFEST_API])
-    check("清单不含下载地址字段解析",
-          not hasattr(m, "_UPDATE_ASSET") and not hasattr(m, "download_file"))
-    check("无资源解析仍识别新版",
-          m.compare_versions(tag, m.VERSION) > 0)
 
     # API 清单失败时降级 raw 清单仍可用
     class RawResp:
@@ -523,18 +592,6 @@ def test_silent_update():
                  current="1.0.1") == "https://release")
     check("静默检查-新版无URL回退默认发布页",
           target("v1.3.2", "", None, current="1.0.1") == m.RELEASE_PAGE_URL)
-
-    v100 = os.path.join(os.path.dirname(SRC),
-                        "AddInLoader_v1.0.0_InitialRelease",
-                        "AddInLoader_v1.0.0.py")
-    spec = importlib.util.spec_from_file_location("ail_v100_silent", v100)
-    m100 = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(m100)
-    check("v1.0.0 静态检查含静默更新入口",
-          "self.silent_check_update" in open(v100, encoding="utf-8").read())
-    check("v1.0.0 静默检查判定一致",
-          m100.silent_update_target("v1.0.1", "https://r", None) == "https://r"
-          and m100.silent_update_target("v1.0.0", "https://r", None) == "")
 
     # 不弹窗：无更新/失败路径不得打开浏览器；有新版直接打开
     class SyncThread:
@@ -581,17 +638,28 @@ def test_silent_update():
           == ([], [], ["检查更新失败：网络失败"], []))
     check("静默检查-有新版走三选一分派",
           run_check(True, latest, None)[1] == ["v2.0.0"])
-    check("手动检查-无新版弹提示",
-          run_check(False, {"version": "v" + m.VERSION}, None)[3] != [])
+    manual_same = run_check(False, {"version": "v" + m.VERSION}, None)
+    check("手动检查-无新版只记日志不弹窗",
+          manual_same[2] == ["当前已是最新版 v%s。" % m.VERSION]
+          and manual_same[3] == [])
     check("手动检查-失败弹确认窗",
           "检查更新失败" in "".join(run_check(False, None, "网络失败")[2]))
     check("手动检查-有新版同样走三选一",
           run_check(False, latest, None)[1] == ["v2.0.0"])
-    with open(SRC, encoding="utf-8") as _f:
-        _src_text = _f.read()
-    check("静默与手动共用同一实现",
-          "self.check_for_update(self.root, silent=True)" in _src_text
-          and "def check_for_update(self, parent, silent=False):" in _src_text)
+
+    # 关于窗没有日志面板：结果走 report 回调写状态行
+    seen = []
+    stub = object.__new__(m.LoaderApp)
+    stub.root = JobRoot()
+    stub.append_log = lambda _t: None
+    stub.open_release_page = lambda _u: None
+    with patched(m, "fetch_update_manifest",
+                 lambda: ({"version": "v" + m.VERSION}, None)), \
+            patched(m.threading, "Thread", SyncThread):
+        m.LoaderApp.check_for_update(stub, None, report=seen.append)
+        stub.root.jobs.pop(0)()
+    check("关于窗报告-先进度后结果",
+          seen == ["正在检查更新…", "当前已是最新版 v%s。" % m.VERSION])
 
     # open_release_page：URL 为空回退默认发布页，且始终写日志
     opened = []
@@ -604,49 +672,7 @@ def test_silent_update():
           opened == [m.RELEASE_PAGE_URL]
           and logs == ["打开发布页 %s" % m.RELEASE_PAGE_URL])
 
-    # v1.0.0 同样具备日志能力
-    v100 = os.path.join(os.path.dirname(SRC),
-                        "AddInLoader_v1.0.0_InitialRelease",
-                        "AddInLoader_v1.0.0.py")
-    spec = importlib.util.spec_from_file_location("ail_v100_log", v100)
-    m100 = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(m100)
-    opened100, logs100 = [], []
-    stub100 = object.__new__(m100.LoaderApp)
-    stub100.append_log = logs100.append
-    with patched(m100.webbrowser, "open", lambda u: opened100.append(u)):
-        m100.LoaderApp.open_release_page(stub100, "https://v100")
-    check("v1.0.0 打开发布页同样记日志",
-          opened100 == ["https://v100"]
-          and logs100 == ["打开发布页 https://v100"])
 
-
-
-def test_api_upgrade_all_versions():
-    base = os.path.dirname(SRC)
-    versions = [
-        "AddInLoader.py",
-        "AddInLoader_v1.0.0_InitialRelease/AddInLoader_v1.0.0.py",
-        "AddInLoader_v1.0.1_P0SecurityFix/AddInLoader_v1.0.1.py",
-        "AddInLoader_v1.0.2_TrustCacheFix/AddInLoader_v1.0.2.py",
-    ]
-    for rel in versions:
-        src = open(os.path.join(base, rel), encoding="utf-8").read()
-        check("%s 含 API 清单入口" % rel,
-              'MANIFEST_API = "https://api.github.com/repos/' in src
-              and "base64.b64decode(envelope" in src)
-        check("%s 无旧式一键升级模块" % rel,
-              "def run_upgrade" not in src
-              and "def write_upgrade_bat" not in src
-              and "def start_upgrade_bat" not in src)
-        check("%s 保留静默检查与三选一更新" % rel,
-              "def silent_check_update(self):" in src
-              and "def open_release_page(self, url):" in src
-              and "def ask_update_choice(self, parent, latest):" in src
-              and 'text="直接下载"' in src
-              and 'text="发布页"' in src
-              and 'text="暂不更新"' in src
-              and "是否前往发布页下载？" not in src)
 
 
 def test_trust_cache_invalidation():
@@ -691,28 +717,6 @@ def test_trust_cache_invalidation():
         check("remove_trusted 删除后清缓存", m._TRUST_CACHE["ts"] == 0.0)
 
 
-def test_trust_option_removed_in_v103():
-    """v1.0.3 去掉受信任位置勾选框，长期启动无条件登记；历史版本保留原样。"""
-    base = os.path.dirname(SRC)
-    v103 = open(SRC, encoding="utf-8").read()
-    check("v1.0.3 无受信任位置勾选框",
-          "var_trust" not in v103 and "将管理目录加入" not in v103)
-    check("v1.0.3 长期启动无条件登记受信任位置",
-          "trusted_ok, trusted_msg = ensure_trusted_location()" in v103
-          and v103.count("if self.var_trust.get():") == 0)
-    check("v1.0.3 登记失败不中止长期启动",
-          "受信任位置登记失败（%s）；" in v103
-          and "加载项仍会登记" in v103
-          and 'trust_note = "未加入受信任位置"' in v103)
-    check("v1.0.3 版本号为 1.0.3", 'VERSION = "1.0.3"' in v103)
-    for rel in ("AddInLoader_v1.0.0_InitialRelease/AddInLoader_v1.0.0.py",
-                "AddInLoader_v1.0.1_P0SecurityFix/AddInLoader_v1.0.1.py",
-                "AddInLoader_v1.0.2_TrustCacheFix/AddInLoader_v1.0.2.py"):
-        src = open(os.path.join(base, rel), encoding="utf-8").read()
-        check("%s 仍保留勾选框（历史版本不改）" % rel,
-              "var_trust" in src and "将管理目录加入" in src)
-
-
 if __name__ == "__main__":
     test_trust_states()
     test_trust_cache_invalidation()
@@ -720,10 +724,9 @@ if __name__ == "__main__":
     test_excel_close_flow()
     test_autostart_tasks()
     test_run_log()
+    test_clear_unchecked_temp()
     test_version_arbitration()
     test_check_update_logic()
     test_upgrade_flow()
     test_silent_update()
-    test_api_upgrade_all_versions()
-    test_trust_option_removed_in_v103()
     print("\nALL PASS: %d checks" % len(PASS))

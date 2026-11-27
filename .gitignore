@@ -1,0 +1,27 @@
+# 构建产物与本地环境
+venv_build/
+__pycache__/
+build/
+dist/
+*.spec
+
+# 发布快照只在本地保留
+AddInLoader_v*/
+
+# 本地调试脚本
+_draw_screenshot.py
+tests/_local/
+tests/e2e_update_local.py
+tests/inject_update_all.py
+tests/test_autostart_rebuild.py
+tests/test_update_chain.py
+
+# 额外许可材料只留本地，不进远端
+Python-LICENSE.txt
+THIRD_PARTY_NOTICES.md
+third_party_licenses/
+third_party_licenses.zip
+
+参考/
+测试用/
+xlam/
